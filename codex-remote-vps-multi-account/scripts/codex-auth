@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="${CODEX_AUTH_MANAGER_HOME:-$HOME/.codex-auth-manager}"
+LOCAL="$BASE/bin/codex-auth-local"
+HOSTS_FILE="$BASE/hosts"
+SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10)
+REMOTE_HELPER='~/.codex-auth-manager/bin/codex-auth-local'
+
+[ -x "$LOCAL" ] || {
+    echo "ERROR=LOCAL_HELPER_NOT_FOUND"
+    exit 1
+}
+
+valid_profile() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+read_hosts() {
+    HOSTS=()
+    [ -f "$HOSTS_FILE" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="$(printf '%s' "$line" | xargs)"
+        [ -n "$line" ] || continue
+        HOSTS+=("$line")
+    done < "$HOSTS_FILE"
+}
+
+remote() {
+    local host="$1"; shift
+    ssh "${SSH_OPTS[@]}" "$host" "$REMOTE_HELPER" "$@"
+}
+
+remote_tty() {
+    local host="$1"; shift
+    ssh -tt -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$host" "$REMOTE_HELPER" "$@"
+}
+
+show_host_header() {
+    printf '\n=== %s ===\n' "$1"
+}
+
+read_hosts
+cmd="${1:-}"
+profile="${2:-}"
+
+case "$cmd" in
+status)
+    show_host_header "master-local"
+    "$LOCAL" status
+    for h in "${HOSTS[@]}"; do
+        show_host_header "$h"
+        remote "$h" status
+    done
+    ;;
+
+list)
+    show_host_header "master-local"
+    "$LOCAL" list
+    for h in "${HOSTS[@]}"; do
+        show_host_header "$h"
+        remote "$h" list
+    done
+    ;;
+
+use)
+    valid_profile "$profile" || {
+        echo "ERROR=INVALID_PROFILE"
+        exit 20
+    }
+
+    echo "=== PREFLIGHT: master-local ==="
+    "$LOCAL" preflight "$profile"
+    for h in "${HOSTS[@]}"; do
+        echo "=== PREFLIGHT: $h ==="
+        remote "$h" preflight "$profile"
+    done
+
+    declare -a switched_kind=()
+    declare -a switched_host=()
+    declare -a previous_profile=()
+
+    rollback() {
+        local i prev
+        echo "ERROR=SWITCH_FAILED; attempting rollback" >&2
+        for ((i=${#switched_kind[@]}-1; i>=0; i--)); do
+            prev="${previous_profile[$i]}"
+            [ -n "$prev" ] && [ "$prev" != "UNKNOWN" ] || continue
+            if [ "${switched_kind[$i]}" = "local" ]; then
+                "$LOCAL" switch "$prev" >/dev/null 2>&1 || true
+            else
+                remote "${switched_host[$i]}" switch "$prev" >/dev/null 2>&1 || true
+            fi
+        done
+    }
+    trap rollback ERR
+
+    for h in "${HOSTS[@]}"; do
+        prev="$(remote "$h" active | tail -n 1)"
+        echo "=== SWITCH: $h ==="
+        remote "$h" switch "$profile"
+        switched_kind+=("remote")
+        switched_host+=("$h")
+        previous_profile+=("$prev")
+    done
+
+    prev="$("$LOCAL" active | tail -n 1)"
+    echo "=== SWITCH: master-local ==="
+    "$LOCAL" switch "$profile"
+    switched_kind+=("local")
+    switched_host+=("")
+    previous_profile+=("$prev")
+
+    trap - ERR
+    echo "ACTIVE_PROFILE=$profile"
+    ;;
+
+add-chatgpt)
+    valid_profile "$profile" || {
+        echo "ERROR=INVALID_PROFILE"
+        exit 20
+    }
+
+    "$LOCAL" assert-absent "$profile"
+    for h in "${HOSTS[@]}"; do
+        remote "$h" assert-absent "$profile"
+    done
+
+    created_local=0
+    created_hosts=()
+    cleanup_created() {
+        if [ "$created_local" -eq 1 ]; then "$LOCAL" remove-profile "$profile" >/dev/null 2>&1 || true; fi
+        for h in "${created_hosts[@]}"; do remote "$h" remove-profile "$profile" >/dev/null 2>&1 || true; done
+    }
+    trap cleanup_created ERR INT TERM
+
+    echo "=== CREATE: master-local ==="
+    "$LOCAL" create-chatgpt "$profile"
+    created_local=1
+
+    for h in "${HOSTS[@]}"; do
+        echo "=== CREATE: $h ==="
+        remote_tty "$h" create-chatgpt "$profile"
+        created_hosts+=("$h")
+    done
+
+    trap - ERR INT TERM
+    echo "PROFILE_CREATED_EVERYWHERE=$profile"
+    ;;
+
+remove)
+    valid_profile "$profile" || {
+        echo "ERROR=INVALID_PROFILE"
+        exit 20
+    }
+    "$LOCAL" remove-profile "$profile"
+    for h in "${HOSTS[@]}"; do remote "$h" remove-profile "$profile"; done
+    echo "PROFILE_REMOVED_EVERYWHERE=$profile"
+    ;;
+
+*)
+    echo "Usage: codex-auth {status|list|use|add-chatgpt|remove} [profile]"
+    exit 2
+    ;;
+esac
