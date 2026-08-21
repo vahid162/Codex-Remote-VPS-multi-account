@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="${CODEX_AUTH_MANAGER_HOME:-$HOME/.codex-auth-manager}"
+PROFILES="${CODEX_AUTH_PROFILES_HOME:-$HOME/.codex-auth/profiles}"
+ACTIVE="$BASE/active-profile"
+AUTH="${CODEX_HOME:-$HOME/.codex}/auth.json"
+CFG="${CODEX_HOME:-$HOME/.codex}/config.toml"
+
+mkdir -p "$BASE" "$PROFILES"
+chmod 700 "$BASE" "$(dirname "$PROFILES")" "$PROFILES" 2>/dev/null || true
+
+profile="${2:-}"
+
+valid_profile() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+require_profile_name() {
+    valid_profile "$profile" || {
+        echo "ERROR=INVALID_PROFILE"
+        exit 20
+    }
+}
+
+safe_auth_metadata() {
+    local file="$1"
+    python3 - "$file" <<'PY'
+import json, sys
+p = sys.argv[1]
+try:
+    with open(p, "r", encoding="utf-8") as f:
+        d = json.load(f)
+except Exception:
+    print("ERROR=INVALID_AUTH_JSON")
+    raise SystemExit(1)
+
+mode = d.get("auth_mode") or d.get("mode") or "unknown"
+print(f"AUTH_MODE={mode}")
+
+tokens = d.get("tokens")
+has_tokens = isinstance(tokens, dict) and bool(tokens)
+print(f"HAS_TOKENS={has_tokens}")
+
+refresh = False
+if isinstance(tokens, dict):
+    refresh = bool(tokens.get("refresh_token") or tokens.get("refreshToken"))
+refresh = refresh or bool(d.get("refresh_token") or d.get("refreshToken"))
+print(f"HAS_REFRESH_TOKEN={refresh}")
+
+api_fields = (
+    "OPENAI_API_KEY", "api_key", "apiKey", "openai_api_key", "OPENAI_API_TOKEN"
+)
+has_api = any(bool(d.get(k)) for k in api_fields)
+if not has_api and isinstance(d.get("credentials"), dict):
+    has_api = any(bool(d["credentials"].get(k)) for k in api_fields)
+print(f"HAS_API_KEY_FIELD={has_api}")
+PY
+}
+
+verify_profile_file() {
+    local file="$1"
+    [ -f "$file" ] || {
+        echo "ERROR=PROFILE_NOT_FOUND"
+        return 21
+    }
+    safe_auth_metadata "$file"
+}
+
+save_live_to_profile() {
+    local name="$1"
+    [ -f "$AUTH" ] || return 0
+    valid_profile "$name" || return 0
+    mkdir -p "$PROFILES/$name"
+    chmod 700 "$PROFILES/$name"
+    install -m 600 "$AUTH" "$PROFILES/$name/auth.json"
+}
+
+clear_stale_model_selection() {
+    if [ -f "$CFG" ]; then
+        sed -i \
+          -e '/^[[:space:]]*model[[:space:]]*=/d' \
+          -e '/^[[:space:]]*model_reasoning_effort[[:space:]]*=/d' \
+          "$CFG"
+    fi
+}
+
+reset_app_server() {
+    pkill -TERM -u "$(id -u)" -f '[c]odex.*app-server' 2>/dev/null || true
+}
+
+cmd="${1:-}"
+case "$cmd" in
+status)
+    echo "HOST=$(hostname)"
+    echo "ACTIVE_PROFILE=$(cat "$ACTIVE" 2>/dev/null || echo UNKNOWN)"
+    codex login status 2>&1 || true
+    ;;
+
+active)
+    cat "$ACTIVE" 2>/dev/null || echo UNKNOWN
+    ;;
+
+list)
+    if [ -d "$PROFILES" ]; then
+        find "$PROFILES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+          | grep -v '^\.' | sort || true
+    fi
+    ;;
+
+assert-absent)
+    require_profile_name
+    if [ -e "$PROFILES/$profile" ]; then
+        echo "ERROR=PROFILE_EXISTS"
+        exit 31
+    fi
+    echo "PROFILE_ABSENT=YES"
+    ;;
+
+preflight)
+    require_profile_name
+    TARGET="$PROFILES/$profile/auth.json"
+    verify_profile_file "$TARGET"
+    echo "PROFILE_OK=YES"
+    ;;
+
+create-chatgpt)
+    require_profile_name
+    FINAL="$PROFILES/$profile"
+    [ ! -e "$FINAL" ] || {
+        echo "ERROR=PROFILE_EXISTS"
+        exit 31
+    }
+
+    TEMP="$PROFILES/.$profile.new.$$"
+    cleanup_temp() { rm -rf "$TEMP"; }
+    trap cleanup_temp EXIT INT TERM
+
+    mkdir -p "$TEMP"
+    chmod 700 "$TEMP"
+    printf '%s\n' 'cli_auth_credentials_store = "file"' > "$TEMP/config.toml"
+    chmod 600 "$TEMP/config.toml"
+
+    CODEX_HOME="$TEMP" codex login --device-auth
+
+    [ -f "$TEMP/auth.json" ] || {
+        echo "ERROR=AUTH_JSON_NOT_CREATED"
+        exit 32
+    }
+    chmod 600 "$TEMP/auth.json"
+
+    python3 - "$TEMP/auth.json" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    d = json.load(f)
+if d.get("auth_mode") != "chatgpt":
+    print("ERROR=NOT_CHATGPT_AUTH")
+    raise SystemExit(1)
+t = d.get("tokens")
+if not isinstance(t, dict) or not t:
+    print("ERROR=MISSING_TOKENS")
+    raise SystemExit(1)
+print("AUTH_MODE=chatgpt")
+print("HAS_TOKENS=True")
+print("HAS_REFRESH_TOKEN=" + str(bool(t.get("refresh_token") or t.get("refreshToken"))))
+PY
+
+    mv "$TEMP" "$FINAL"
+    chmod 700 "$FINAL"
+    trap - EXIT INT TERM
+    echo "PROFILE_CREATED=$profile"
+    ;;
+
+create-api)
+    require_profile_name
+    FINAL="$PROFILES/$profile"
+    [ ! -e "$FINAL" ] || {
+        echo "ERROR=PROFILE_EXISTS"
+        exit 31
+    }
+
+    TEMP="$PROFILES/.$profile.new.$$"
+    cleanup_temp() { rm -rf "$TEMP"; }
+    trap cleanup_temp EXIT INT TERM
+
+    mkdir -p "$TEMP"
+    chmod 700 "$TEMP"
+    printf '%s\n' 'cli_auth_credentials_store = "file"' > "$TEMP/config.toml"
+    chmod 600 "$TEMP/config.toml"
+
+    IFS= read -r api_key || true
+    [ -n "${api_key:-}" ] || {
+        echo "ERROR=EMPTY_API_KEY"
+        exit 35
+    }
+    printf '%s' "$api_key" | CODEX_HOME="$TEMP" codex login --with-api-key >/dev/null
+    unset api_key
+
+    [ -f "$TEMP/auth.json" ] || {
+        echo "ERROR=AUTH_JSON_NOT_CREATED"
+        exit 32
+    }
+    chmod 600 "$TEMP/auth.json"
+
+    python3 - "$TEMP/auth.json" <<'PYAPI'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    d = json.load(f)
+if d.get("auth_mode") != "apikey":
+    print("ERROR=NOT_APIKEY_AUTH")
+    raise SystemExit(1)
+keys = ("OPENAI_API_KEY", "api_key", "apiKey", "openai_api_key", "OPENAI_API_TOKEN")
+has_key = any(bool(d.get(k)) for k in keys)
+if not has_key and isinstance(d.get("credentials"), dict):
+    has_key = any(bool(d["credentials"].get(k)) for k in keys)
+if not has_key:
+    print("ERROR=MISSING_API_KEY_FIELD")
+    raise SystemExit(1)
+print("AUTH_MODE=apikey")
+print("HAS_API_KEY_FIELD=True")
+PYAPI
+
+    mv "$TEMP" "$FINAL"
+    chmod 700 "$FINAL"
+    trap - EXIT INT TERM
+    echo "PROFILE_CREATED=$profile"
+    ;;
+
+remove-profile)
+    require_profile_name
+    CURRENT="$(cat "$ACTIVE" 2>/dev/null || true)"
+    if [ "$CURRENT" = "$profile" ]; then
+        echo "ERROR=CANNOT_REMOVE_ACTIVE_PROFILE"
+        exit 34
+    fi
+    [ -e "$PROFILES/$profile" ] || {
+        echo "ERROR=PROFILE_NOT_FOUND"
+        exit 21
+    }
+    rm -rf "$PROFILES/$profile"
+    echo "PROFILE_REMOVED=$profile"
+    ;;
+
+switch)
+    require_profile_name
+    TARGET="$PROFILES/$profile/auth.json"
+    [ -f "$TARGET" ] || {
+        echo "ERROR=PROFILE_NOT_FOUND"
+        exit 21
+    }
+
+    CURRENT="$(cat "$ACTIVE" 2>/dev/null || true)"
+
+    if [ "$CURRENT" = "$profile" ]; then
+        save_live_to_profile "$profile"
+        echo "ALREADY_ACTIVE=$profile"
+        codex login status 2>&1 || true
+        exit 0
+    fi
+
+    if [ -n "$CURRENT" ] && [ "$CURRENT" != "UNKNOWN" ]; then
+        save_live_to_profile "$CURRENT"
+    fi
+
+    mkdir -p "$(dirname "$AUTH")"
+    chmod 700 "$(dirname "$AUTH")"
+    TMP="$(dirname "$AUTH")/auth.json.new.$$"
+    install -m 600 "$TARGET" "$TMP"
+    mv -f "$TMP" "$AUTH"
+
+    clear_stale_model_selection
+
+    printf '%s\n' "$profile" > "$ACTIVE"
+    chmod 600 "$ACTIVE"
+
+    echo "SWITCHED_TO=$profile"
+    echo "MODEL_SELECTION_CLEARED=YES"
+
+    reset_app_server
+    echo "APP_SERVER_RESET=OK"
+
+    codex login status 2>&1 || true
+    ;;
+
+*)
+    echo "Usage: codex-auth-local {status|active|list|assert-absent|preflight|create-chatgpt|create-api|remove-profile|switch} [profile]"
+    exit 2
+    ;;
+esac
